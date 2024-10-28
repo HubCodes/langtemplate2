@@ -11,6 +11,7 @@ use nom::{
 use std::{
     collections::HashMap,
     io::{self, Write},
+    ptr::null,
 };
 
 #[derive(Debug, Clone)]
@@ -56,8 +57,8 @@ impl std::fmt::Debug for Data {
         unsafe {
             write!(
                 f,
-                "Data {{ int: {:?}, string: {:?}, symbol: {:?}, list: {:?} }}",
-                self.int, self.string, self.symbol, self.list
+                "Data {{ int: {:?}, string: {:?}, symbol: {:?}, list: {:?}, func: {:?} }}",
+                self.int, &*self.string, &*self.symbol, self.list, self.func
             )
         }
     }
@@ -80,24 +81,39 @@ struct Func {
 
 struct Memory {
     heap: *mut Object,
+    limit: *mut Object,
+    next: *mut Object,
     string_pool: Vec<String>, // TODO improve
+    string_pool_limit: usize,
 }
 
 impl Memory {
-    fn from_ptr(ptr: *mut Object) -> Self {
+    fn from_ptr(ptr: *mut Object, size: usize) -> Self {
+        // if cap change -> dangling ptr
+        let string_pool_limit = 1024;
+        let string_pool = Vec::with_capacity(string_pool_limit);
         Self {
             heap: ptr,
-            string_pool: Vec::new(),
+            limit: unsafe { (ptr as *const u8).add(size) as *mut Object },
+            next: ptr,
+            string_pool,
+            string_pool_limit,
         }
     }
 
     fn alloc(&mut self) -> *mut Object {
-        let ptr = self.heap;
-        self.heap = unsafe { self.heap.add(1) };
+        if unsafe { self.next.add(1) } >= self.limit {
+            panic!("Out of memory");
+        }
+        let ptr = self.next;
+        self.next = unsafe { self.next.add(1) };
         ptr
     }
 
     fn intern(&mut self, s: String) -> *const String {
+        if self.string_pool.len() >= self.string_pool_limit {
+            panic!("String pool limit exceeded");
+        }
         self.string_pool.push(s);
         self.string_pool.last().unwrap() as *const String
     }
@@ -181,8 +197,8 @@ impl Parser {
 }
 
 struct Evaluator {
-    stack: Vec<*const Object>,
-    env: Vec<HashMap<String, *const Object>>,
+    stack: Vec<*const Object>,                // TODO improve
+    env: Vec<HashMap<String, *const Object>>, // TODO improve
     memory: Memory,
 }
 
@@ -269,10 +285,17 @@ impl Evaluator {
 
         for i in 0..arity {
             let param = unsafe { (*signature).data.list.head };
+            let param_tag = unsafe { (*param).tag };
+            if param_tag != Tag::Symbol {
+                return Err(format!("expected symbol, got {:?}", param_tag));
+            }
             let value = self.stack[self.stack.len() - i - 1];
             let param_str = unsafe { (*param).data.symbol };
             new_env.insert(unsafe { (*param_str).clone() }, value);
             signature = unsafe { (*signature).data.list.tail };
+        }
+        for _ in 0..arity {
+            self.stack.pop();
         }
         self.env.push(new_env);
         self.do_eval(unsafe { (*func_obj).data.func.body })?;
@@ -315,10 +338,8 @@ impl Evaluator {
     fn alloc_nil(&mut self) -> Result<*const Object, String> {
         let ptr = self.memory.alloc();
         unsafe {
-            ptr.write(Object {
-                tag: Tag::Nil,
-                data: Data { int: 0 },
-            });
+            (*ptr).tag = Tag::Nil;
+            (*ptr).data.int = 0;
         }
         Ok(ptr)
     }
@@ -326,10 +347,8 @@ impl Evaluator {
     fn alloc_int(&mut self, i: &i64) -> Result<*const Object, String> {
         let ptr = self.memory.alloc();
         unsafe {
-            ptr.write(Object {
-                tag: Tag::Int,
-                data: Data { int: *i },
-            });
+            (*ptr).tag = Tag::Int;
+            (*ptr).data.int = *i;
         }
         Ok(ptr)
     }
@@ -338,10 +357,8 @@ impl Evaluator {
         let str = self.memory.intern(s.clone());
         let ptr = self.memory.alloc();
         unsafe {
-            ptr.write(Object {
-                tag: Tag::String,
-                data: Data { string: str },
-            });
+            (*ptr).tag = Tag::String;
+            (*ptr).data.string = str;
         }
         Ok(ptr)
     }
@@ -350,10 +367,8 @@ impl Evaluator {
         let str = self.memory.intern(s.clone());
         let ptr = self.memory.alloc();
         unsafe {
-            ptr.write(Object {
-                tag: Tag::Symbol,
-                data: Data { symbol: str },
-            });
+            (*ptr).tag = Tag::Symbol;
+            (*ptr).data.symbol = str;
         }
         Ok(ptr)
     }
@@ -361,10 +376,8 @@ impl Evaluator {
     fn alloc_list(&mut self, elements: Vec<*const Object>) -> Result<*const Object, String> {
         let mut last = self.memory.alloc();
         unsafe {
-            last.write(Object {
-                tag: Tag::Nil,
-                data: Data { int: 0 },
-            })
+            (*last).tag = Tag::Nil;
+            (*last).data.int = 0;
         }
 
         for i in (0..elements.len()).rev() {
@@ -375,10 +388,8 @@ impl Evaluator {
             };
             last = self.memory.alloc();
             unsafe {
-                last.write(Object {
-                    tag: Tag::List,
-                    data: Data { list: cell },
-                });
+                (*last).tag = Tag::List;
+                (*last).data.list = cell;
             }
         }
         Ok(last)
@@ -391,16 +402,12 @@ impl Evaluator {
         if let AST::List(l) = params.as_ref() {
             let arity = l.len();
             unsafe {
-                ptr.write(Object {
-                    tag: Tag::Func,
-                    data: Data {
-                        func: Func {
-                            params: params_ptr,
-                            body: body_ptr,
-                            arity,
-                        },
-                    },
-                });
+                (*ptr).tag = Tag::Func;
+                (*ptr).data.func = Func {
+                    params: params_ptr,
+                    body: body_ptr,
+                    arity,
+                };
             }
             Ok(ptr)
         } else {
@@ -410,13 +417,15 @@ impl Evaluator {
 }
 
 fn main() {
+    let size = 16384;
     let raw_memory = unsafe {
-        let layout = std::alloc::Layout::from_size_align(1024, 8).unwrap();
+        let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         std::alloc::alloc(layout) as *mut Object
     };
-    let memory = Memory::from_ptr(raw_memory);
+    let memory = Memory::from_ptr(raw_memory, size);
     let mut evaluator = Evaluator::new(memory);
 
+    println!("heap address: {:p}", raw_memory);
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
