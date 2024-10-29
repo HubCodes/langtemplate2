@@ -11,7 +11,6 @@ use nom::{
 use std::{
     collections::HashMap,
     io::{self, Write},
-    ptr::null,
 };
 
 #[derive(Debug, Clone)]
@@ -40,7 +39,16 @@ enum Tag {
     Symbol,
     List,
     Func,
+    Builtin,
 }
+
+impl Tag {
+    fn is_callable(&self) -> bool {
+        matches!(self, Tag::Func | Tag::Builtin)
+    }
+}
+
+type BuiltinFn = *const (dyn Fn(&mut Evaluator, *const Object) -> Result<(), String> + 'static);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -50,6 +58,7 @@ union Data {
     symbol: *const String,
     list: Cell,
     func: Func,
+    builtin: BuiltinFn,
 }
 
 impl std::fmt::Debug for Data {
@@ -58,7 +67,7 @@ impl std::fmt::Debug for Data {
             write!(
                 f,
                 "Data {{ int: {:?}, string: {:?}, symbol: {:?}, list: {:?}, func: {:?} }}",
-                self.int, &*self.string, &*self.symbol, self.list, self.func
+                self.int, self.string, self.symbol, self.list, self.func
             )
         }
     }
@@ -76,7 +85,6 @@ struct Cell {
 struct Func {
     params: *const Object,
     body: *const Object,
-    arity: usize,
 }
 
 struct Memory {
@@ -203,6 +211,12 @@ struct Evaluator {
 }
 
 impl Evaluator {
+    const NIL_OBJ: Object = Object {
+        tag: Tag::Nil,
+        data: Data { int: 0 },
+    };
+    const NIL: *const Object = &Self::NIL_OBJ;
+
     fn new(memory: Memory) -> Self {
         let global_env = HashMap::new();
         Self {
@@ -210,6 +224,21 @@ impl Evaluator {
             env: vec![global_env],
             memory,
         }
+    }
+
+    fn init(&mut self) {
+        self.register_builtin("quote", &Self::eval_quote as BuiltinFn);
+        self.register_builtin("define", &Self::eval_define as BuiltinFn);
+        self.register_builtin("print", &Self::eval_print as BuiltinFn);
+    }
+
+    fn register_builtin(&mut self, symbol: &str, func: BuiltinFn) {
+        let ptr = self.memory.alloc();
+        unsafe {
+            (*ptr).tag = Tag::Builtin;
+            (*ptr).data.builtin = func;
+        }
+        self.env[0].insert(symbol.to_string(), ptr);
     }
 
     fn eval(&mut self, ast: &AST) -> Result<(), String> {
@@ -233,6 +262,7 @@ impl Evaluator {
             Tag::Symbol => self.eval_symbol(obj)?,
             Tag::List => self.eval_fn_call(obj)?,
             Tag::Func => self.eval_func(obj)?,
+            Tag::Builtin => self.eval_builtin(obj)?,
         }
         Ok(())
     }
@@ -269,21 +299,27 @@ impl Evaluator {
         self.do_eval(func)?;
         let func_obj = self.stack.pop().unwrap();
         let func_tag = unsafe { (*func_obj).tag };
-        if func_tag != Tag::Func {
-            return Err(format!("expected function, got {:?}", func_tag));
+        if !func_tag.is_callable() {
+            return Err(format!("expected function or builtin, got {:?}", func_tag));
         }
         let args_tag = unsafe { (*args).tag };
         if args_tag != Tag::List {
             return Err(format!("expected arg list, got {:?}", args_tag));
         }
-        self.eval_list(args)?;
-        self.stack.pop(); // drop nil
+        if Tag::Builtin == func_tag {
+            return self.eval_builtin_call(func_obj, args);
+        }
 
-        let arity = unsafe { (*func_obj).data.func.arity };
+        // there is no SP yet; calc diff
+        let stack_len_before = self.stack.len();
+        self.eval_list_spread(args)?;
+        self.stack.pop(); // drop nil
+        let args_len = stack_len_before - self.stack.len();
+
         let mut signature = unsafe { (*func_obj).data.func.params };
         let mut new_env: HashMap<String, *const Object> = HashMap::new();
 
-        for i in 0..arity {
+        for i in 0..args_len {
             let param = unsafe { (*signature).data.list.head };
             let param_tag = unsafe { (*param).tag };
             if param_tag != Tag::Symbol {
@@ -294,7 +330,7 @@ impl Evaluator {
             new_env.insert(unsafe { (*param_str).clone() }, value);
             signature = unsafe { (*signature).data.list.tail };
         }
-        for _ in 0..arity {
+        for _ in 0..args_len {
             self.stack.pop();
         }
         self.env.push(new_env);
@@ -304,12 +340,109 @@ impl Evaluator {
         Ok(())
     }
 
+    fn eval_builtin_call(
+        &mut self,
+        builtin: *const Object,
+        args: *const Object,
+    ) -> Result<(), String> {
+        let func = unsafe { (*builtin).data.builtin };
+        unsafe { (*func)(self, args) }
+    }
+
+    fn eval_builtin(&mut self, builtin: *const Object) -> Result<(), String> {
+        self.stack.push(builtin);
+        Ok(())
+    }
+
+    fn eval_quote(&mut self, args: *const Object) -> Result<(), String> {
+        self.eval_list(args)?;
+        let list = self.stack.pop().unwrap();
+        self.stack.push(list);
+        Ok(())
+    }
+
+    fn eval_define(&mut self, args: *const Object) -> Result<(), String> {
+        let symbol = unsafe { (*args).data.list.head };
+        let value = unsafe { (*(*args).data.list.tail).data.list.head };
+        let symbol_str = unsafe { (*symbol).data.symbol };
+        self.do_eval(value)?;
+        let value = self.stack.pop().unwrap();
+
+        self.env
+            .last_mut()
+            .unwrap()
+            .insert(unsafe { (*symbol_str).clone() }, value);
+        self.stack.push(Self::NIL);
+        Ok(())
+    }
+
+    fn eval_print(&mut self, args: *const Object) -> Result<(), String> {
+        self.eval_list_spread(args)?;
+        let arg = self.stack.pop().unwrap();
+        self.do_eval_print(arg)?;
+        println!();
+        self.stack.push(Self::NIL);
+        Ok(())
+    }
+
+    fn do_eval_print(&mut self, arg: *const Object) -> Result<(), String> {
+        unsafe {
+            match (*arg).tag {
+                Tag::Int => print!("{}", (*arg).data.int),
+                Tag::String => print!("{}", (*(*arg).data.string).as_str()),
+                Tag::Nil => print!("nil"),
+                Tag::Symbol => print!("{}", (*(*arg).data.symbol).as_str()),
+                Tag::List => {
+                    print!("(");
+                    let mut list = arg;
+                    loop {
+                        let head = (*list).data.list.head;
+                        self.do_eval_print(head)?;
+                        list = (*list).data.list.tail;
+                        if (*list).tag == Tag::Nil {
+                            break;
+                        }
+                        print!(" ");
+                    }
+                    print!(")");
+                }
+                Tag::Func => print!("#<function>"),
+                Tag::Builtin => print!("#<builtin>"),
+            }
+        }
+        Ok(())
+    }
+
     fn eval_list(&mut self, obj: *const Object) -> Result<(), String> {
-        let list = unsafe { &(*obj).data.list };
-        let head = list.head;
-        let tail = list.tail;
-        self.do_eval(head)?;
-        self.do_eval(tail)?;
+        let mut list = obj;
+        let mut new_list = self.memory.alloc();
+        unsafe {
+            (*new_list).tag = Tag::Nil;
+            (*new_list).data.int = 0;
+        }
+        while unsafe { (*list).tag != Tag::Nil } {
+            let head = unsafe { (*list).data.list.head };
+            self.do_eval(head)?;
+            list = unsafe { (*list).data.list.tail };
+
+            let tail = new_list;
+            new_list = self.memory.alloc();
+            unsafe {
+                (*new_list).tag = Tag::List;
+                (*new_list).data.list = Cell { head, tail };
+            }
+        }
+        self.stack.push(new_list);
+        Ok(())
+    }
+
+    fn eval_list_spread(&mut self, obj: *const Object) -> Result<(), String> {
+        let mut list = obj;
+        while unsafe { (*list).tag != Tag::Nil } {
+            let head = unsafe { (*list).data.list.head };
+            self.do_eval(head)?;
+            list = unsafe { (*list).data.list.tail };
+        }
         Ok(())
     }
 
@@ -336,12 +469,7 @@ impl Evaluator {
     }
 
     fn alloc_nil(&mut self) -> Result<*const Object, String> {
-        let ptr = self.memory.alloc();
-        unsafe {
-            (*ptr).tag = Tag::Nil;
-            (*ptr).data.int = 0;
-        }
-        Ok(ptr)
+        Ok(Self::NIL)
     }
 
     fn alloc_int(&mut self, i: &i64) -> Result<*const Object, String> {
@@ -399,14 +527,12 @@ impl Evaluator {
         let ptr = self.memory.alloc();
         let params_ptr = self.alloc_ast(params)?;
         let body_ptr = self.alloc_ast(body)?;
-        if let AST::List(l) = params.as_ref() {
-            let arity = l.len();
+        if let AST::List(_) = params.as_ref() {
             unsafe {
                 (*ptr).tag = Tag::Func;
                 (*ptr).data.func = Func {
                     params: params_ptr,
                     body: body_ptr,
-                    arity,
                 };
             }
             Ok(ptr)
@@ -424,6 +550,7 @@ fn main() {
     };
     let memory = Memory::from_ptr(raw_memory, size);
     let mut evaluator = Evaluator::new(memory);
+    evaluator.init();
 
     println!("heap address: {:p}", raw_memory);
     loop {
