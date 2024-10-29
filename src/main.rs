@@ -10,7 +10,8 @@ use nom::{
 
 use std::{
     collections::HashMap,
-    io::{self, Write}, ptr::null_mut,
+    io::{self, Write},
+    ptr::null_mut,
 };
 
 #[derive(Debug, Clone)]
@@ -49,7 +50,8 @@ impl Tag {
     }
 }
 
-type BuiltinFn = *const (dyn Fn(&mut Evaluator, *const Object, *mut Context) -> Result<(), String> + 'static);
+type BuiltinFn =
+    *const (dyn Fn(&mut Evaluator, *const Object, *mut Context) -> Result<(), String> + 'static);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -232,7 +234,7 @@ impl Parser {
 }
 
 struct Evaluator {
-    stack: Vec<*const Object>,                // TODO improve
+    stack: Vec<*const Object>, // TODO improve
     root_context: *mut Context,
     memory: Memory,
 }
@@ -476,7 +478,10 @@ impl Evaluator {
         let arg1_tag = unsafe { (*arg1).tag };
         let arg2_tag = unsafe { (*arg2).tag };
         if arg1_tag != Tag::Int || arg2_tag != Tag::Int {
-            return Err(format!("expected int, got {:?} and {:?}", arg1_tag, arg2_tag));
+            return Err(format!(
+                "expected int, got {:?} and {:?}",
+                arg1_tag, arg2_tag
+            ));
         }
         let result = unsafe { (*arg1).data.int } < unsafe { (*arg2).data.int };
         let result = if result { 1 } else { 0 };
@@ -536,7 +541,11 @@ impl Evaluator {
         Ok(())
     }
 
-    fn eval_list_spread(&mut self, obj: *const Object, context: *mut Context) -> Result<(), String> {
+    fn eval_list_spread(
+        &mut self,
+        obj: *const Object,
+        context: *mut Context,
+    ) -> Result<(), String> {
         let mut list = obj;
         while unsafe { (*list).tag != Tag::Nil } {
             let head = unsafe { (*list).data.list.head };
