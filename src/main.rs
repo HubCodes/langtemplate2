@@ -230,6 +230,9 @@ impl Evaluator {
         self.register_builtin("quote", &Self::eval_quote as BuiltinFn);
         self.register_builtin("define", &Self::eval_define as BuiltinFn);
         self.register_builtin("print", &Self::eval_print as BuiltinFn);
+        self.register_builtin("+", &Self::eval_add as BuiltinFn);
+        self.register_builtin("if", &Self::eval_if as BuiltinFn);
+        self.register_builtin("<", &Self::eval_lt as BuiltinFn);
     }
 
     fn register_builtin(&mut self, symbol: &str, func: BuiltinFn) {
@@ -284,13 +287,16 @@ impl Evaluator {
 
     fn eval_symbol(&mut self, obj: *const Object) -> Result<(), String> {
         let symbol = unsafe { (*obj).data.symbol };
-        let env = self.env.last().unwrap();
         let symbol_str = unsafe { (*symbol).as_str() };
-        let value = env
-            .get(symbol_str)
-            .ok_or(format!("symbol not found: {}", symbol_str))?;
-        self.stack.push(*value);
-        Ok(())
+
+        for env in self.env.iter().rev() {
+            let value = env.get(symbol_str);
+            if value.is_some() {
+                self.stack.push(*value.unwrap());
+                return Ok(());
+            }
+        }
+        Err(format!("symbol not found: {}", symbol_str))
     }
 
     fn eval_fn_call(&mut self, obj: *const Object) -> Result<(), String> {
@@ -382,6 +388,56 @@ impl Evaluator {
         self.do_eval_print(arg)?;
         println!();
         self.stack.push(Self::NIL);
+        Ok(())
+    }
+
+    fn eval_add(&mut self, args: *const Object) -> Result<(), String> {
+        let before_stack_len = self.stack.len();
+        self.eval_list_spread(args)?;
+        let arg_count = self.stack.len() - before_stack_len;
+
+        let mut result = 0;
+        for _ in 0..arg_count {
+            let arg = self.stack.pop().unwrap();
+            result += unsafe { (*arg).data.int };
+        }
+        let ptr = self.alloc_int(&result)?;
+        self.stack.push(ptr);
+        Ok(())
+    }
+
+    fn eval_if(&mut self, args: *const Object) -> Result<(), String> {
+        let cond = unsafe { (*args).data.list.head };
+        let then_branch = unsafe { (*(*args).data.list.tail).data.list.head };
+        let else_branch = unsafe { (*(*(*args).data.list.tail).data.list.tail).data.list.head };
+
+        self.do_eval(cond)?;
+        let cond = self.stack.pop().unwrap();
+        let cond_tag = unsafe { (*cond).tag };
+        if cond_tag != Tag::Int {
+            return Err(format!("expected int, got {:?}", cond_tag));
+        }
+        if unsafe { (*cond).data.int } != 0 {
+            self.do_eval(then_branch)?;
+        } else {
+            self.do_eval(else_branch)?;
+        }
+        Ok(())
+    }
+
+    fn eval_lt(&mut self, args: *const Object) -> Result<(), String> {
+        self.eval_list_spread(args)?;
+        let arg2 = self.stack.pop().unwrap();
+        let arg1 = self.stack.pop().unwrap();
+        let arg1_tag = unsafe { (*arg1).tag };
+        let arg2_tag = unsafe { (*arg2).tag };
+        if arg1_tag != Tag::Int || arg2_tag != Tag::Int {
+            return Err(format!("expected int, got {:?} and {:?}", arg1_tag, arg2_tag));
+        }
+        let result = unsafe { (*arg1).data.int } < unsafe { (*arg2).data.int };
+        let result = if result { 1 } else { 0 };
+        let ptr = self.alloc_int(&result)?;
+        self.stack.push(ptr);
         Ok(())
     }
 
