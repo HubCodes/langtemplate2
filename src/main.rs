@@ -9,7 +9,7 @@ use nom::{
 };
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, LinkedList, VecDeque},
     io::{self, Write},
     ptr::null_mut,
 };
@@ -30,6 +30,7 @@ struct Object {
     tag: Tag,
     context: *mut Context,
     data: Data,
+    using: bool,
 }
 
 #[repr(C)]
@@ -102,33 +103,50 @@ struct Memory {
     stack_offset: usize,
 
     heap: *mut Object,
-    limit: *mut Object,
-    next: *mut Object,
+    heap_size: usize,
+    freelist: LinkedList<*mut Object>,
+    always_gc: bool,
 
     string_pool: Vec<String>, // TODO improve
     string_pool_limit: usize,
 
     context: *mut Context,
-    context_limit: *mut Context,
-    next_context: *mut Context,
+    context_offset: usize,
+    context_size: usize,
 }
 
 impl Memory {
-    fn from_ptr(ptr: *mut Object, context: *mut Context, size: usize) -> Self {
+    fn from_ptr(
+        heap: *mut Object,
+        context: *mut Context,
+        size: usize,
+        always_gc: bool,
+    ) -> Self {
         // if cap change -> dangling ptr
         let string_pool_limit = 1024;
         let string_pool = Vec::with_capacity(string_pool_limit);
+        let mut freelist = LinkedList::new();
+        if !always_gc {
+            for i in 0..size {
+                freelist.push_front(unsafe { heap.add(i) });
+            }
+        }
+
         Self {
             stack: [null_mut(); 4096],
             stack_offset: 0,
-            heap: ptr,
-            limit: unsafe { (ptr as *const u8).add(size) as *mut Object },
-            next: ptr,
+
+            heap,
+            heap_size: size,
+            freelist,
+            always_gc,
+
             string_pool,
             string_pool_limit,
+
             context,
-            context_limit: unsafe { (context as *const u8).add(size) as *mut Context },
-            next_context: context,
+            context_offset: 0,
+            context_size: size,
         }
     }
 
@@ -153,24 +171,31 @@ impl Memory {
     }
 
     fn alloc(&mut self) -> *mut Object {
-        if unsafe { self.next.add(1) } >= self.limit {
-            panic!("Out of memory");
+        if self.freelist.is_empty() {
+            self.gc();
+            if self.freelist.is_empty() {
+                panic!("Out of memory");
+            }
         }
-        let ptr = self.next;
-        self.next = unsafe { self.next.add(1) };
+        if self.always_gc {
+            self.gc();
+        }
+        let ptr = self.freelist.pop_front().unwrap();
+        println!("allocating {:?}, size of freelist: {}", ptr, self.freelist.len());
         ptr
     }
 
     fn alloc_context(&mut self) -> *mut Context {
-        if unsafe { self.next_context.add(1) } >= self.context_limit {
+        let limit = unsafe { self.context.add(self.context_size) };
+        if unsafe { self.context.add(self.context_offset + 1) } >= limit {
             panic!("Out of memory");
         }
-        let ptr = self.next_context;
+        let ptr = unsafe { self.context.add(self.context_offset) };
         unsafe {
             (*ptr).parent = null_mut();
             (*ptr).symbols = HashMap::new();
         }
-        self.next_context = unsafe { self.next_context.add(1) };
+        self.context_offset += 1;
         ptr
     }
 
@@ -180,6 +205,59 @@ impl Memory {
         }
         self.string_pool.push(s);
         self.string_pool.last().unwrap() as *const String
+    }
+
+    fn gc(&mut self) {
+        let mut root_set = Vec::new();
+        for i in 0..self.stack_offset {
+            root_set.push(self.stack[i] as *mut Object);
+        }
+        for obj in &root_set {
+            unsafe {
+                (**obj).using = true;
+            }
+            self.dfs(*obj);
+        }
+        for i in 0..self.context_offset {
+            let context = unsafe { self.context.add(i) };
+            for (_, value) in unsafe { (*context).symbols.iter() } {
+                root_set.push(*value as *mut Object);
+            }
+        }
+
+        for i in 0..self.heap_size {
+            let obj = unsafe { self.heap.add(i as usize) };
+            if unsafe { (*obj).using } {
+                unsafe { (*obj).using = false };
+                continue;
+            }
+            self.freelist.push_front(obj);
+        }
+    }
+
+    fn dfs(&mut self, obj: *mut Object) {
+        if unsafe { (*obj).using } {
+            return;
+        }
+        unsafe {
+            (*obj).using = true;
+        }
+        let tag = unsafe { (*obj).tag };
+        match tag {
+            Tag::Nil => (),
+            Tag::Int => (),
+            Tag::String => (),
+            Tag::Symbol => (),
+            Tag::List => {
+                self.dfs(unsafe { (*obj).data.list.head } as *mut Object);
+                self.dfs(unsafe { (*obj).data.list.tail } as *mut Object);
+            },
+            Tag::Func => {
+                self.dfs(unsafe { (*obj).data.func.params } as *mut Object);
+                self.dfs(unsafe { (*obj).data.func.body } as *mut Object);
+            },
+            Tag::Builtin => (),
+        }
     }
 }
 
@@ -270,6 +348,7 @@ impl Evaluator {
         tag: Tag::Nil,
         context: null_mut(),
         data: Data { int: 0 },
+        using: true,
     };
     const NIL: *const Object = &Self::NIL_OBJ;
 
@@ -614,6 +693,7 @@ impl Evaluator {
             (*ptr).tag = Tag::Int;
             (*ptr).context = self.root_context;
             (*ptr).data.int = *i;
+            (*ptr).using = false;
         }
         Ok(ptr)
     }
@@ -625,6 +705,7 @@ impl Evaluator {
             (*ptr).tag = Tag::String;
             (*ptr).context = self.root_context;
             (*ptr).data.string = str;
+            (*ptr).using = false;
         }
         Ok(ptr)
     }
@@ -636,6 +717,7 @@ impl Evaluator {
             (*ptr).tag = Tag::Symbol;
             (*ptr).context = self.root_context;
             (*ptr).data.symbol = str;
+            (*ptr).using = false;
         }
         Ok(ptr)
     }
@@ -646,6 +728,7 @@ impl Evaluator {
             (*last).tag = Tag::Nil;
             (*last).context = self.root_context;
             (*last).data.int = 0;
+            (*last).using = false;
         }
 
         for i in (0..elements.len()).rev() {
@@ -659,6 +742,7 @@ impl Evaluator {
                 (*last).tag = Tag::List;
                 (*last).context = self.root_context;
                 (*last).data.list = cell;
+                (*last).using = false;
             }
         }
         Ok(last)
@@ -676,6 +760,7 @@ impl Evaluator {
                     params: params_ptr,
                     body: body_ptr,
                 };
+                (*ptr).using = false;
             }
             Ok(ptr)
         } else {
@@ -694,7 +779,12 @@ fn main() {
         let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
         std::alloc::alloc(layout) as *mut Context
     };
-    let memory = Memory::from_ptr(raw_memory, context, size);
+    let memory = Memory::from_ptr(
+        raw_memory,
+        context,
+        size,
+        true,
+    );
     let mut evaluator = Evaluator::new(memory);
     evaluator.init();
 
