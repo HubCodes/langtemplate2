@@ -9,7 +9,7 @@ use nom::{
 };
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, Write},
     ptr::null_mut,
 };
@@ -98,11 +98,16 @@ struct Context {
 }
 
 struct Memory {
+    stack: [*const Object; 4096],
+    stack_offset: usize,
+
     heap: *mut Object,
     limit: *mut Object,
     next: *mut Object,
+
     string_pool: Vec<String>, // TODO improve
     string_pool_limit: usize,
+
     context: *mut Context,
     context_limit: *mut Context,
     next_context: *mut Context,
@@ -114,6 +119,8 @@ impl Memory {
         let string_pool_limit = 1024;
         let string_pool = Vec::with_capacity(string_pool_limit);
         Self {
+            stack: [null_mut(); 4096],
+            stack_offset: 0,
             heap: ptr,
             limit: unsafe { (ptr as *const u8).add(size) as *mut Object },
             next: ptr,
@@ -123,6 +130,26 @@ impl Memory {
             context_limit: unsafe { (context as *const u8).add(size) as *mut Context },
             next_context: context,
         }
+    }
+
+    fn push(&mut self, obj: *const Object) {
+        if self.stack_offset >= self.stack.len() {
+            panic!("Stack overflow");
+        }
+        self.stack[self.stack_offset] = obj;
+        self.stack_offset += 1;
+    }
+
+    fn pop(&mut self) -> *const Object {
+        if self.stack_offset == 0 {
+            panic!("empty stack");
+        }
+        self.stack_offset -= 1;
+        self.stack[self.stack_offset]
+    }
+
+    fn stack_len(&self) -> usize {
+        self.stack_offset
     }
 
     fn alloc(&mut self) -> *mut Object {
@@ -234,7 +261,6 @@ impl Parser {
 }
 
 struct Evaluator {
-    stack: Vec<*const Object>, // TODO improve
     root_context: *mut Context,
     memory: Memory,
 }
@@ -249,7 +275,6 @@ impl Evaluator {
 
     fn new(memory: Memory) -> Self {
         Self {
-            stack: Vec::new(),
             root_context: null_mut(),
             memory,
         }
@@ -285,7 +310,7 @@ impl Evaluator {
 
     fn eval_repl(&mut self, ast: &AST) -> Result<*const Object, String> {
         self.eval(ast)?;
-        let result = self.stack.pop().unwrap();
+        let result = self.memory.pop();
         Ok(result)
     }
 
@@ -304,17 +329,17 @@ impl Evaluator {
     }
 
     fn eval_nil(&mut self, obj: *const Object) -> Result<(), String> {
-        self.stack.push(obj);
+        self.memory.push(obj);
         Ok(())
     }
 
     fn eval_int(&mut self, obj: *const Object) -> Result<(), String> {
-        self.stack.push(obj);
+        self.memory.push(obj);
         Ok(())
     }
 
     fn eval_string(&mut self, obj: *const Object) -> Result<(), String> {
-        self.stack.push(obj);
+        self.memory.push(obj);
         Ok(())
     }
 
@@ -326,7 +351,7 @@ impl Evaluator {
         while context != null_mut() {
             let value = unsafe { (*context).symbols.get(symbol_str) };
             if value.is_some() {
-                self.stack.push(*value.unwrap());
+                self.memory.push(*value.unwrap());
                 return Ok(());
             }
             context = unsafe { (*context).parent };
@@ -338,7 +363,7 @@ impl Evaluator {
         let func = unsafe { (*obj).data.list.head };
         let args = unsafe { (*obj).data.list.tail };
         self.do_eval(func, context)?;
-        let func_obj = self.stack.pop().unwrap();
+        let func_obj = self.memory.pop();
         let func_tag = unsafe { (*func_obj).tag };
         if !func_tag.is_callable() {
             return Err(format!("expected function or builtin, got {:?}", func_tag));
@@ -352,27 +377,29 @@ impl Evaluator {
         }
 
         // there is no SP yet; calc diff
-        let stack_len_before = self.stack.len();
+        let stack_len_before = self.memory.stack_len();
         self.eval_list_spread(args, context)?;
-        let args_len = self.stack.len() - stack_len_before;
+        let args_len = self.memory.stack_len() - stack_len_before;
 
         let mut signature = unsafe { (*func_obj).data.func.params };
         let mut new_env: HashMap<String, *const Object> = HashMap::new();
 
-        for i in 0..args_len {
+        let mut params = VecDeque::new();
+        for _ in 0..args_len {
+            params.push_front(self.memory.pop());
+        }
+        for _ in 0..args_len {
             let param = unsafe { (*signature).data.list.head };
             let param_tag = unsafe { (*param).tag };
             if param_tag != Tag::Symbol {
                 return Err(format!("expected symbol, got {:?}", param_tag));
             }
-            let value = self.stack[self.stack.len() - i - 1];
             let param_str = unsafe { (*param).data.symbol };
+            let value = params.pop_front().unwrap();
             new_env.insert(unsafe { (*param_str).clone() }, value);
             signature = unsafe { (*signature).data.list.tail };
         }
-        for _ in 0..args_len {
-            self.stack.pop();
-        }
+        
         let prev_context = unsafe { (*func_obj).context };
         let new_context = self.memory.alloc_context();
         unsafe {
@@ -380,14 +407,14 @@ impl Evaluator {
             (*new_context).symbols = new_env;
         }
         self.do_eval(unsafe { (*func_obj).data.func.body }, new_context)?;
-        let result_obj = self.stack.pop().unwrap();
+        let result_obj = self.memory.pop();
         let new_result_obj = self.memory.alloc();
         unsafe {
             (*new_result_obj).tag = (*result_obj).tag;
             (*new_result_obj).context = new_context;
             (*new_result_obj).data.func = (*result_obj).data.func;
         }
-        self.stack.push(new_result_obj);
+        self.memory.push(new_result_obj);
         Ok(())
     }
 
@@ -402,14 +429,14 @@ impl Evaluator {
     }
 
     fn eval_builtin(&mut self, builtin: *const Object) -> Result<(), String> {
-        self.stack.push(builtin);
+        self.memory.push(builtin);
         Ok(())
     }
 
     fn eval_quote(&mut self, args: *const Object, context: *mut Context) -> Result<(), String> {
         self.eval_list(args, context)?;
-        let list = self.stack.pop().unwrap();
-        self.stack.push(list);
+        let list = self.memory.pop();
+        self.memory.push(list);
         Ok(())
     }
 
@@ -418,37 +445,37 @@ impl Evaluator {
         let value = unsafe { (*(*args).data.list.tail).data.list.head };
         let symbol_str = unsafe { (*symbol).data.symbol };
         self.do_eval(value, context)?;
-        let value = self.stack.pop().unwrap();
+        let value = self.memory.pop();
 
         let context = unsafe { (*symbol).context };
         unsafe {
             (*context).symbols.insert((*symbol_str).clone(), value);
         }
-        self.stack.push(Self::NIL);
+        self.memory.push(Self::NIL);
         Ok(())
     }
 
     fn eval_print(&mut self, args: *const Object, context: *mut Context) -> Result<(), String> {
         self.eval_list_spread(args, context)?;
-        let arg = self.stack.pop().unwrap();
+        let arg = self.memory.pop();
         self.do_eval_print(arg, context)?;
         println!();
-        self.stack.push(Self::NIL);
+        self.memory.push(Self::NIL);
         Ok(())
     }
 
     fn eval_add(&mut self, args: *const Object, context: *mut Context) -> Result<(), String> {
-        let before_stack_len = self.stack.len();
+        let before_stack_len = self.memory.stack_len();
         self.eval_list_spread(args, context)?;
-        let arg_count = self.stack.len() - before_stack_len;
+        let arg_count = self.memory.stack_len() - before_stack_len;
 
         let mut result = 0;
         for _ in 0..arg_count {
-            let arg = self.stack.pop().unwrap();
+            let arg = self.memory.pop();
             result += unsafe { (*arg).data.int };
         }
         let ptr = self.alloc_int(&result)?;
-        self.stack.push(ptr);
+        self.memory.push(ptr);
         Ok(())
     }
 
@@ -458,7 +485,7 @@ impl Evaluator {
         let else_branch = unsafe { (*(*(*args).data.list.tail).data.list.tail).data.list.head };
 
         self.do_eval(cond, context)?;
-        let cond = self.stack.pop().unwrap();
+        let cond = self.memory.pop();
         let cond_tag = unsafe { (*cond).tag };
         if cond_tag != Tag::Int {
             return Err(format!("expected int, got {:?}", cond_tag));
@@ -473,8 +500,8 @@ impl Evaluator {
 
     fn eval_lt(&mut self, args: *const Object, context: *mut Context) -> Result<(), String> {
         self.eval_list_spread(args, context)?;
-        let arg2 = self.stack.pop().unwrap();
-        let arg1 = self.stack.pop().unwrap();
+        let arg2 = self.memory.pop();
+        let arg1 = self.memory.pop();
         let arg1_tag = unsafe { (*arg1).tag };
         let arg2_tag = unsafe { (*arg2).tag };
         if arg1_tag != Tag::Int || arg2_tag != Tag::Int {
@@ -486,7 +513,7 @@ impl Evaluator {
         let result = unsafe { (*arg1).data.int } < unsafe { (*arg2).data.int };
         let result = if result { 1 } else { 0 };
         let ptr = self.alloc_int(&result)?;
-        self.stack.push(ptr);
+        self.memory.push(ptr);
         Ok(())
     }
 
@@ -537,7 +564,7 @@ impl Evaluator {
                 (*new_list).data.list = Cell { head, tail };
             }
         }
-        self.stack.push(new_list);
+        self.memory.push(new_list);
         Ok(())
     }
 
@@ -556,7 +583,7 @@ impl Evaluator {
     }
 
     fn eval_func(&mut self, obj: *const Object) -> Result<(), String> {
-        self.stack.push(obj);
+        self.memory.push(obj);
         Ok(())
     }
 
